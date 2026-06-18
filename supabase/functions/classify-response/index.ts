@@ -264,13 +264,18 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
 
-  // Record the response with its classification.
-  const { error: insertError } = await supabase.from("responses").insert({
-    appointment_id: appointment?.id ?? null,
-    phone,
-    message_text: message,
-    classification,
-  });
+  // Record the response with its classification. Capture the new row id so we
+  // can flag it as alerted once a human handoff text goes out.
+  const { data: insertedResponse, error: insertError } = await supabase
+    .from("responses")
+    .insert({
+      appointment_id: appointment?.id ?? null,
+      phone,
+      message_text: message,
+      classification,
+    })
+    .select("id")
+    .single();
 
   if (insertError) {
     return jsonResponse(
@@ -278,6 +283,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
       500,
     );
   }
+
+  const responseId = insertedResponse?.id ?? null;
 
   const firstName = appointment?.first_name ?? "Customer";
 
@@ -292,6 +299,20 @@ Deno.serve(async (req: Request): Promise<Response> => {
         `WALKER BDC: ${firstName} responded ${classification}. ` +
         `Their message: '${message}'. Take over now.`;
       await sendOpenPhoneMessage(openphoneKey, openphoneNumber, alertPhone, alert);
+
+      // Mark the response as alerted so the EOD brief can surface it as needing
+      // follow-up. The alert already went out, so a failure here is non-fatal.
+      if (responseId != null) {
+        const { error: alertFlagError } = await supabase
+          .from("responses")
+          .update({ alert_sent: true })
+          .eq("id", responseId);
+        if (alertFlagError) {
+          console.error(
+            `Failed to set alert_sent for response ${responseId}: ${alertFlagError.message}`,
+          );
+        }
+      }
     }
   } catch (err) {
     // The response is already recorded; surface the send failure but don't lose
