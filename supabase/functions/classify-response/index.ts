@@ -1,317 +1,158 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// supabase/functions/classify-response/index.ts
-//
-// Called by an OpenPhone webhook whenever a customer replies to an outreach text.
-// It extracts the customer's phone number and message from the webhook payload,
-// finds the matching appointment, asks Claude (claude-sonnet-4-6) to classify the
-// reply as "positive", "negative", or "gray", records the reply in the
-// `responses` table with that classification, and then either alerts a human
-// (positive / gray) or auto-replies with a polite close-out (negative).
-//
-// Environment:
-//   ANTHROPIC_API_KEY           - Claude API key
-//   OPENPHONE_API_KEY           - OpenPhone API key
-//   OPENPHONE_NUMBER            - OpenPhone phone number to send from (E.164)
-//   ALERT_PHONE                 - phone number that receives takeover alerts
-//   SUPABASE_URL                - injected by the Supabase runtime
-//   SUPABASE_SERVICE_ROLE_KEY   - service role key (bypasses RLS)
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
 
-import { createClient } from "jsr:@supabase/supabase-js@2";
+const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
+const OPENPHONE_API_KEY = Deno.env.get("OPENPHONE_API_KEY")!;
+const OPENPHONE_NUMBER = Deno.env.get("OPENPHONE_NUMBER")!;
+const ALERT_PHONE = Deno.env.get("ALERT_PHONE")!;
 
-const OPENPHONE_API_URL = "https://api.openphone.com/v1/messages";
-const MODEL = "claude-sonnet-4-6";
+const NEGATIVE_REPLY = "Got it, appreciate you being part of the Walker family. Save my number and I'm here when you need me.";
+const POSITIVE_REPLY_FALLBACK = "Ok great, I'll get to work for you.";
 
-// Polite, relationship-preserving auto-reply sent when a customer is not interested.
-const NEGATIVE_REPLY =
-  "Got it, appreciate you being part of the Walker family. " +
-  "Save my number and I'm here when you need me.";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
-
-type Classification = "positive" | "negative" | "gray";
-
-interface Appointment {
-  id: number | string;
-  first_name: string | null;
-  phone: string | null;
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+async function sendText(to: string, message: string) {
+  await fetch("https://api.openphone.com/v1/messages", {
+    method: "POST",
+    headers: { Authorization: OPENPHONE_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: OPENPHONE_NUMBER, to: [to], content: message }),
   });
 }
 
-// Keep only the digits of a phone number so numbers that differ only by
-// formatting (spaces, dashes, "+1", parens) still match between OpenPhone and
-// whatever was stored on the appointment row.
-function normalizePhone(phone: string): string {
-  const digits = phone.replace(/\D/g, "");
-  // Drop a leading US country code so "+15551234567" and "5551234567" match.
-  return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
-}
-
-// Pull the customer's phone number and message text out of the OpenPhone webhook
-// payload. OpenPhone nests the event under data.object; for an inbound message
-// the customer is `from` and the body is `text` (with `body` as a fallback).
-function extractInbound(
-  payload: unknown,
-): { phone: string; message: string } | null {
-  const obj =
-    (payload as { data?: { object?: Record<string, unknown> } })?.data?.object ??
-    (payload as Record<string, unknown>);
-
-  if (!obj || typeof obj !== "object") return null;
-
-  const record = obj as Record<string, unknown>;
-  const phone = record.from;
-  const message = record.text ?? record.body;
-
-  if (typeof phone !== "string" || typeof message !== "string") return null;
-  if (!phone.trim() || !message.trim()) return null;
-
-  return { phone, message };
-}
-
-async function classifyMessage(
-  message: string,
-  apiKey: string,
-): Promise<Classification> {
-  const classificationPrompt =
-    "A customer at a car dealership received a text asking if they were " +
-    "interested in upgrading their vehicle. Classify their reply below as " +
-    "exactly one of these three labels:\n\n" +
-    "positive = interested, curious, maybe, or any engagement that is not a " +
-    "clear no.\n" +
-    "negative = not interested, happy with their current car, asks to stop, " +
-    "or says no thanks.\n" +
-    "gray = vague, ambiguous, or unclear intent.\n\n" +
-    `Customer reply: "${message}"\n\n` +
-    'Respond with only one word: "positive", "negative", or "gray".';
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+async function classify(message: string): Promise<string> {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
-      "x-api-key": apiKey,
+      "x-api-key": ANTHROPIC_API_KEY,
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 100,
-      messages: [{ role: "user", content: classificationPrompt }],
+      model: "claude-sonnet-4-6",
+      max_tokens: 10,
+      messages: [{
+        role: "user",
+        content: `Classify this text message response as exactly one word: positive, negative, or gray.\npositive = interested, curious, maybe, any engagement\nnegative = not interested, happy with car, stop, no thanks\ngray = vague, ambiguous\n\nMessage: "${message}"\n\nRespond with one word only.`
+      }]
     }),
   });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`Anthropic API error ${response.status}: ${detail}`);
-  }
-
-  const data = await response.json();
-
-  // The model returns its label as plain text; normalize and validate it.
-  const text = (data.content ?? [])
-    .filter((block: { type: string }) => block.type === "text")
-    .map((block: { text?: string }) => block.text ?? "")
-    .join(" ")
-    .toLowerCase();
-
-  const classification: Classification | null = text.includes("positive")
-    ? "positive"
-    : text.includes("negative")
-    ? "negative"
-    : text.includes("gray")
-    ? "gray"
-    : null;
-
-  if (classification === null) {
-    throw new Error("Claude did not return a valid classification.");
-  }
-
-  return classification;
+  const data = await res.json();
+  const text = data.content?.[0]?.text?.toLowerCase().trim() || "gray";
+  if (text.includes("positive")) return "positive";
+  if (text.includes("negative")) return "negative";
+  return "gray";
 }
 
-// Send a single SMS through OpenPhone.
-async function sendOpenPhoneMessage(
-  apiKey: string,
-  from: string,
-  to: string,
-  content: string,
-): Promise<void> {
-  const res = await fetch(OPENPHONE_API_URL, {
+async function generateReply(message: string): Promise<string> {
+  const prompt = `You are Rich, Exchange Manager at Walker Chevrolet. A customer just replied to your outreach text. Generate a short, casual, human response that matches their energy. One to two sentences max. No exclamation points unless they used one. Sound like a real person texting, not a salesperson.
+
+Use these as reference responses for similar situations:
+- If they say sure/yes/interested: 'I can get some options for you, are you in the service department now or did you drop off?'
+- If they ask what exchange eligible means: 'We are looking for vehicles that have been serviced here and we may be able to help you exchange if you are looking to upgrade.'
+- If they ask what you would offer: 'I can get to work for you on that, is it here now?'
+- If they say maybe/depends/not right now: 'Got it, if you like I can get you an idea of estimated value so you at least have that info? Happy to help either way.'
+- If they just bought the car: 'Got it, appreciate you servicing with us today and being a part of the Walker family. Have a great one!'
+- If already working with someone: 'Perfect, who are you working with? I can let them know we spoke.'
+- If they ask how it works: 'It is actually quick and easy, would love to put a face to the text. Are you here now or stopping in later?'
+
+Customer message: '${message}'
+
+Reply only with the text message response. Nothing else.`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
-      Authorization: apiKey,
-      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
     },
-    body: JSON.stringify({ from, to: [to], content }),
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 150,
+      messages: [{ role: "user", content: prompt }],
+    }),
   });
-
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`OpenPhone API error ${res.status}: ${detail}`);
-  }
+  const data = await res.json();
+  return data.content?.[0]?.text?.trim() || POSITIVE_REPLY_FALLBACK;
 }
 
-Deno.serve(async (req: Request): Promise<Response> => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
-  }
-
-  if (req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed. Use POST." }, 405);
-  }
-
-  const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY");
-  const openphoneKey = Deno.env.get("OPENPHONE_API_KEY");
-  const openphoneNumber = Deno.env.get("OPENPHONE_NUMBER");
-  const alertPhone = Deno.env.get("ALERT_PHONE");
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-  if (!anthropicKey) {
-    return jsonResponse({ error: "ANTHROPIC_API_KEY is not configured." }, 500);
-  }
-  if (!openphoneKey || !openphoneNumber || !alertPhone) {
-    return jsonResponse(
-      { error: "OPENPHONE_API_KEY, OPENPHONE_NUMBER, or ALERT_PHONE is not configured." },
-      500,
-    );
-  }
-  if (!supabaseUrl || !serviceRoleKey) {
-    return jsonResponse(
-      { error: "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not configured." },
-      500,
-    );
-  }
-
-  // Parse the webhook payload.
-  let payload: unknown;
+async function processMessage(phone: string, message: string) {
   try {
-    payload = await req.json();
-  } catch {
-    return jsonResponse({ error: "Request body must be valid JSON." }, 400);
-  }
+    const digits = phone.replace(/\D/g, "").slice(-10);
+    const { data: appointments } = await supabase
+      .from("appointments")
+      .select("id, first_name, phone")
+      .eq("approved", true);
 
-  const inbound = extractInbound(payload);
-  if (!inbound) {
-    return jsonResponse(
-      { error: "Could not extract phone number and message from webhook payload." },
-      400,
-    );
-  }
-  const { phone, message } = inbound;
+    const appointment = (appointments || []).find((a: any) => {
+      const aDigits = (a.phone || "").replace(/\D/g, "").slice(-10);
+      return aDigits === digits;
+    });
 
-  const supabase = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { persistSession: false },
-  });
+    const classification = await classify(message);
 
-  // Look up the matching appointment by phone number. Phone formats can differ
-  // between systems, so match on the normalized (digits-only) suffix.
-  const normalized = normalizePhone(phone);
-  const { data: appointments, error: fetchError } = await supabase
-    .from("appointments")
-    .select("id, first_name, phone")
-    .ilike("phone", `%${normalized.slice(-10)}%`);
-
-  if (fetchError) {
-    return jsonResponse(
-      { error: `Failed to look up appointment: ${fetchError.message}` },
-      500,
-    );
-  }
-
-  // Prefer an exact normalized match; fall back to the first loose match.
-  const matches = (appointments ?? []) as Appointment[];
-  const appointment =
-    matches.find((a) => a.phone && normalizePhone(a.phone) === normalized) ??
-    matches[0] ??
-    null;
-
-  // Classify the reply with Claude.
-  let classification: Classification;
-  try {
-    classification = await classifyMessage(message, anthropicKey);
-  } catch (err) {
-    return jsonResponse(
-      { error: `Failed to classify response: ${(err as Error).message}` },
-      502,
-    );
-  }
-
-  // Record the response with its classification. Capture the new row id so we
-  // can flag it as alerted once a human handoff text goes out.
-  const { data: insertedResponse, error: insertError } = await supabase
-    .from("responses")
-    .insert({
-      appointment_id: appointment?.id ?? null,
+    await supabase.from("responses").insert({
+      appointment_id: appointment?.id || null,
       phone,
       message_text: message,
       classification,
-    })
-    .select("id")
-    .single();
+      alert_sent: false,
+    });
 
-  if (insertError) {
-    return jsonResponse(
-      { error: `Failed to record response: ${insertError.message}` },
-      500,
-    );
-  }
+    // Wait before replying so the response feels human.
+    await delay(45000);
 
-  const responseId = insertedResponse?.id ?? null;
-
-  const firstName = appointment?.first_name ?? "Customer";
-
-  // Act on the classification.
-  try {
     if (classification === "negative") {
-      // Politely close the loop with the customer; no human handoff needed.
-      await sendOpenPhoneMessage(openphoneKey, openphoneNumber, phone, NEGATIVE_REPLY);
+      await sendText(phone, NEGATIVE_REPLY);
     } else {
-      // positive or gray -> alert a human to take over the conversation.
-      const alert =
-        `WALKER BDC: ${firstName} responded ${classification}. ` +
-        `Their message: '${message}'. Take over now.`;
-      await sendOpenPhoneMessage(openphoneKey, openphoneNumber, alertPhone, alert);
-
-      // Mark the response as alerted so the EOD brief can surface it as needing
-      // follow-up. The alert already went out, so a failure here is non-fatal.
-      if (responseId != null) {
-        const { error: alertFlagError } = await supabase
-          .from("responses")
-          .update({ alert_sent: true })
-          .eq("id", responseId);
-        if (alertFlagError) {
-          console.error(
-            `Failed to set alert_sent for response ${responseId}: ${alertFlagError.message}`,
-          );
-        }
+      const reply = await generateReply(message);
+      await sendText(phone, reply);
+      await sendText(ALERT_PHONE, `WALKER BDC: ${appointment?.first_name || "Customer"} responded ${classification}. Their message: '${message}'. Take over now.`);
+      if (appointment?.id) {
+        await supabase.from("responses").update({ alert_sent: true }).eq("appointment_id", appointment.id).eq("classification", classification);
       }
     }
   } catch (err) {
-    // The response is already recorded; surface the send failure but don't lose
-    // the classification work. Still return 200 so OpenPhone doesn't retry the
-    // webhook and re-run the classification.
-    return jsonResponse({
-      ok: true,
-      classification,
-      appointment_id: appointment?.id ?? null,
-      warning: `Classified and recorded, but follow-up send failed: ${(err as Error).message}`,
-    });
+    console.error("classify-response background error:", err);
   }
+}
 
-  return jsonResponse({
-    ok: true,
-    classification,
-    appointment_id: appointment?.id ?? null,
-  });
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { status: 200 });
+  if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
+
+  try {
+    const payload = await req.json();
+
+    // Only process inbound messages — ignore everything else to prevent the outbound message loop.
+    if (payload?.type !== "message.received") return new Response("OK", { status: 200 });
+
+    const direction = payload?.data?.object?.direction || payload?.direction || "";
+    if (direction === "outbound") return new Response("OK", { status: 200 });
+    const phone = payload?.data?.object?.from || payload?.from || "";
+    const message = payload?.data?.object?.body || payload?.data?.object?.text || payload?.body || payload?.text || "";
+
+    if (!phone || !message) return new Response("OK", { status: 200 });
+
+    // Secondary loop prevention — ignore any message that came from our own OpenPhone number.
+    const fromDigits = phone.replace(/\D/g, "").slice(-10);
+    const ourDigits = OPENPHONE_NUMBER.replace(/\D/g, "").slice(-10);
+    if (fromDigits === ourDigits) return new Response("OK", { status: 200 });
+
+    // Respond 200 OK immediately, then do the classify + 45s delay + reply work in the
+    // background. This prevents OpenPhone from retrying the webhook while we wait.
+    EdgeRuntime.waitUntil(processMessage(phone, message));
+
+    return new Response("OK", { status: 200 });
+  } catch (err) {
+    console.error("classify-response error:", err);
+    return new Response("OK", { status: 200 });
+  }
 });
