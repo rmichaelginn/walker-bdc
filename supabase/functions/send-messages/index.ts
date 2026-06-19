@@ -1,10 +1,17 @@
 // supabase/functions/send-messages/index.ts
 //
-// Accepts a POST with an array of approved appointment IDs. For each appointment
-// it loads the customer record from the `appointments` table, builds a
-// personalized SMS, sends it via the OpenPhone API to the customer's phone, and
-// logs the outbound message to the `messages` table. Returns a summary of how
-// many messages were sent.
+// Accepts a POST in one of two modes:
+//
+//   1. Explicit: { "appointment_ids": [...] } — sends the listed appointments.
+//   2. Auto:     { "auto": true } — ignores any appointment_ids and instead
+//      queries the `appointments` table for every record that is approved, whose
+//      scheduled send time has arrived (or is unset), and that has no existing
+//      outbound message, then sends all of them.
+//
+// For each selected appointment it loads the customer record from the
+// `appointments` table, builds a personalized SMS, sends it via the OpenPhone
+// API to the customer's phone, and logs the outbound message to the `messages`
+// table. Returns a summary of how many messages were sent.
 //
 // Environment:
 //   OPENPHONE_API_KEY           - OpenPhone API key
@@ -104,37 +111,56 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   // Parse and validate the request body.
-  let payload: { appointment_ids?: unknown };
+  let payload: { appointment_ids?: unknown; auto?: unknown };
   try {
     payload = await req.json();
   } catch {
     return jsonResponse({ error: "Request body must be valid JSON." }, 400);
   }
 
-  const ids = payload.appointment_ids;
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return jsonResponse(
-      { error: "Missing or invalid `appointment_ids` (non-empty array of IDs)." },
-      400,
-    );
+  // In auto mode we ignore any supplied appointment_ids and discover the full
+  // set of eligible appointments ourselves. Otherwise a non-empty array of IDs
+  // is required.
+  const auto = payload.auto === true;
+
+  let ids: unknown[] = [];
+  if (!auto) {
+    const supplied = payload.appointment_ids;
+    if (!Array.isArray(supplied) || supplied.length === 0) {
+      return jsonResponse(
+        {
+          error:
+            "Missing or invalid `appointment_ids` (non-empty array of IDs), or set `auto: true`.",
+        },
+        400,
+      );
+    }
+    ids = supplied;
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false },
   });
 
-  // Load every requested appointment in one query. Only approved appointments
-  // whose scheduled send time has arrived (or that have no scheduled time) are
-  // eligible — anything scheduled for the future stays queued until NOW() passes
-  // it. The "no existing outbound message" condition is enforced per-appointment
-  // by the recent-contact dedup check in the loop below.
+  // Load the eligible appointments. Only approved appointments whose scheduled
+  // send time has arrived (or that have no scheduled time) are eligible —
+  // anything scheduled for the future stays queued until NOW() passes it. In
+  // explicit mode the set is further narrowed to the requested IDs; in auto mode
+  // the full table is scanned. The "no existing outbound message" condition is
+  // applied for auto mode below (and reinforced per-appointment by the
+  // recent-contact dedup check in the loop).
   const nowIso = new Date().toISOString();
-  const { data: appointments, error: fetchError } = await supabase
+  let query = supabase
     .from("appointments")
     .select("id, first_name, vehicle_year, vehicle_model, phone")
-    .in("id", ids)
     .eq("approved", true)
     .or(`scheduled_send_at.is.null,scheduled_send_at.lte.${nowIso}`);
+
+  if (!auto) {
+    query = query.in("id", ids);
+  }
+
+  const { data: appointments, error: fetchError } = await query;
 
   if (fetchError) {
     return jsonResponse(
@@ -143,7 +169,31 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
 
-  const found = (appointments ?? []) as Appointment[];
+  let found = (appointments ?? []) as Appointment[];
+
+  // Auto mode: drop any appointment that already has an outbound message so we
+  // only send to records that have never been contacted.
+  if (auto && found.length > 0) {
+    const { data: outbound, error: outboundError } = await supabase
+      .from("messages")
+      .select("appointment_id")
+      .eq("direction", "outbound")
+      .in("appointment_id", found.map((a) => a.id));
+
+    if (outboundError) {
+      return jsonResponse(
+        {
+          error: `Failed to check existing outbound messages: ${outboundError.message}`,
+        },
+        500,
+      );
+    }
+
+    const alreadyMessaged = new Set(
+      (outbound ?? []).map((m) => String(m.appointment_id)),
+    );
+    found = found.filter((a) => !alreadyMessaged.has(String(a.id)));
+  }
 
   // Any outbound message newer than this cutoff counts as a recent contact.
   const ninetyDaysAgo = new Date(
@@ -235,20 +285,24 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
   }
 
-  // Note any requested IDs that had no matching appointment row.
-  const foundIds = new Set(found.map((a) => String(a.id)));
-  for (const id of ids) {
-    if (!foundIds.has(String(id))) {
-      results.push({
-        appointment_id: id as Appointment["id"],
-        status: "skipped",
-        error: "Appointment not found.",
-      });
+  // Note any requested IDs that had no matching appointment row. Only relevant
+  // in explicit mode — auto mode has no caller-supplied IDs to reconcile.
+  if (!auto) {
+    const foundIds = new Set(found.map((a) => String(a.id)));
+    for (const id of ids) {
+      if (!foundIds.has(String(id))) {
+        results.push({
+          appointment_id: id as Appointment["id"],
+          status: "skipped",
+          error: "Appointment not found.",
+        });
+      }
     }
   }
 
   return jsonResponse({
-    requested: ids.length,
+    mode: auto ? "auto" : "explicit",
+    requested: auto ? found.length : ids.length,
     sent,
     skipped_recent_contact: skippedRecent,
     results,

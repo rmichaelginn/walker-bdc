@@ -218,24 +218,31 @@ function createServer(): McpServer {
     "approve_appointments",
     "Approve appointments by ID (sets approved = true).",
     {
-      appointment_ids: z
-        .array(z.union([z.number(), z.string()]))
+      appointments: z
+        .array(z.object({ id: z.string(), scheduled_send_at: z.string().nullable() }))
         .min(1)
-        .describe("IDs of the appointments to approve."),
+        .describe(
+          "Appointments to approve. Each item has an id (UUID) and scheduled_send_at " +
+            "(ISO timestamp, or null to send immediately).",
+        ),
     },
-    async ({ appointment_ids }) => {
+    async ({ appointments }) => {
       try {
         const supabase = supabaseClient();
-        const { data, error } = await supabase
-          .from("appointments")
-          .update({ approved: true })
-          .in("id", appointment_ids)
-          .select("id");
+        const approved: string[] = [];
+        for (const { id, scheduled_send_at } of appointments) {
+          const { data, error } = await supabase
+            .from("appointments")
+            .update({ approved: true, scheduled_send_at })
+            .eq("id", id)
+            .select("id");
 
-        if (error) return errorResult(`Failed to approve appointments: ${error.message}`);
+          if (error) return errorResult(`Failed to approve appointment ${id}: ${error.message}`);
+          if (data) approved.push(...data.map((r) => r.id));
+        }
         return textResult({
-          approved: data?.map((r) => r.id) ?? [],
-          count: data?.length ?? 0,
+          approved,
+          count: approved.length,
         });
       } catch (err) {
         return errorResult((err as Error).message);
