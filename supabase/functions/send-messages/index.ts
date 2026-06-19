@@ -123,11 +123,18 @@ Deno.serve(async (req: Request): Promise<Response> => {
     auth: { persistSession: false },
   });
 
-  // Load every requested appointment in one query.
+  // Load every requested appointment in one query. Only approved appointments
+  // whose scheduled send time has arrived (or that have no scheduled time) are
+  // eligible — anything scheduled for the future stays queued until NOW() passes
+  // it. The "no existing outbound message" condition is enforced per-appointment
+  // by the recent-contact dedup check in the loop below.
+  const nowIso = new Date().toISOString();
   const { data: appointments, error: fetchError } = await supabase
     .from("appointments")
     .select("id, first_name, vehicle_year, vehicle_model, phone")
-    .in("id", ids);
+    .in("id", ids)
+    .eq("approved", true)
+    .or(`scheduled_send_at.is.null,scheduled_send_at.lte.${nowIso}`);
 
   if (fetchError) {
     return jsonResponse(

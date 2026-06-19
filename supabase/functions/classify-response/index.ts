@@ -86,6 +86,9 @@ Reply only with the text message response. Nothing else.`;
 
 async function processMessage(phone: string, message: string) {
   try {
+    // The inbound webhook sends phone as E.164 (+19316741400) but our messages
+    // table stores it as 10 digits (9316741400). Normalize both sides to the
+    // last 10 digits before comparing so the dedup/eligibility checks match.
     const digits = phone.replace(/\D/g, "").slice(-10);
     const matchesPhone = (p: string | null) =>
       (p || "").replace(/\D/g, "").slice(-10) === digits;
@@ -97,11 +100,8 @@ async function processMessage(phone: string, message: string) {
       .from("responses")
       .select("phone")
       .gte("created_at", cutoff);
-
-    if ((recentResponses || []).some((r: any) => matchesPhone(r.phone))) {
-      console.log("classify-response: already replied to this number in last 24h, skipping");
-      return;
-    }
+    const alreadyReplied = (recentResponses || []).some((r: any) =>
+      matchesPhone(r.phone));
 
     // Bug fix 2: only respond to people we texted first. If there's no outbound
     // message to this phone in our system, skip.
@@ -109,8 +109,21 @@ async function processMessage(phone: string, message: string) {
       .from("messages")
       .select("phone")
       .eq("direction", "outbound");
+    const weTextedFirst = (outbound || []).some((m: any) =>
+      matchesPhone(m.phone));
 
-    if (!(outbound || []).some((m: any) => matchesPhone(m.phone))) {
+    console.log(
+      `classify-response: processMessage phone=${phone} normalized=${digits} ` +
+        `recentReplyCheck=${alreadyReplied ? "FAIL(already replied in 24h)" : "PASS"} ` +
+        `textedFirstCheck=${weTextedFirst ? "PASS" : "FAIL(no prior outbound)"}`
+    );
+
+    if (alreadyReplied) {
+      console.log("classify-response: already replied to this number in last 24h, skipping");
+      return;
+    }
+
+    if (!weTextedFirst) {
       console.log("classify-response: no prior outbound message to this number, skipping");
       return;
     }
@@ -122,20 +135,59 @@ async function processMessage(phone: string, message: string) {
 
     const appointment = (appointments || []).find((a: any) => matchesPhone(a.phone));
 
+    // Stale lock self-healing. If a previous handler crashed after claiming the
+    // lock but before promoting it, the 'processing' row would block this number
+    // forever. Clear any 'processing' row older than 5 minutes (far longer than
+    // a normal 45s handler) so a crashed run heals automatically and we proceed.
+    const staleCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    await supabase
+      .from("responses")
+      .delete()
+      .eq("phone", phone)
+      .eq("classification", "processing")
+      .lt("created_at", staleCutoff);
+
+    // Atomic dedup lock. Claim this number by inserting a placeholder
+    // "processing" row up front, before the 45s human-delay window. A partial
+    // unique index on responses(phone) WHERE classification = 'processing'
+    // (see migration 20260619201701_responses_processing_lock.sql) means a
+    // second webhook that fires during the delay hits a unique-constraint
+    // violation here and bails — only one handler per number ever replies.
+    const { data: lockRow, error: lockError } = await supabase
+      .from("responses")
+      .insert({
+        appointment_id: appointment?.id || null,
+        phone,
+        message_text: message,
+        classification: "processing",
+        alert_sent: false,
+      })
+      .select("id")
+      .single();
+
+    if (lockError || !lockRow) {
+      console.log(
+        `classify-response: could not acquire processing lock for ${phone} ` +
+          `(another webhook already handling this message), skipping`,
+        lockError?.message ?? ""
+      );
+      return;
+    }
+
     const classification = await classify(message);
 
-    await supabase.from("responses").insert({
-      appointment_id: appointment?.id || null,
-      phone,
-      message_text: message,
-      classification,
-      alert_sent: false,
-    });
+    // Promote the placeholder lock row to its real classification. This releases
+    // the 'processing' lock while leaving a row that the 24h recent-reply check
+    // will see, blocking any duplicate webhooks that arrive after this point.
+    await supabase
+      .from("responses")
+      .update({ classification, appointment_id: appointment?.id || null })
+      .eq("id", lockRow.id);
 
     if (classification === "unclear") {
       // Don't reply to unusual messages — alert the team to handle it manually, immediately (no delay).
       await sendText(ALERT_PHONE, `WALKER BDC: ${appointment?.first_name || "Customer"} sent an unusual message: '${message}'. Review and respond manually.`);
-      await supabase.from("responses").update({ alert_sent: true }).eq("phone", phone).eq("classification", classification);
+      await supabase.from("responses").update({ alert_sent: true }).eq("id", lockRow.id);
     } else if (classification === "negative") {
       // Wait before replying to the customer so the response feels human.
       await delay(45000);
@@ -146,9 +198,7 @@ async function processMessage(phone: string, message: string) {
       const reply = await generateReply(message);
       await sendText(phone, reply);
       await sendText(ALERT_PHONE, `WALKER BDC: ${appointment?.first_name || "Customer"} responded ${classification}. Their message: '${message}'. Take over now.`);
-      if (appointment?.id) {
-        await supabase.from("responses").update({ alert_sent: true }).eq("appointment_id", appointment.id).eq("classification", classification);
-      }
+      await supabase.from("responses").update({ alert_sent: true }).eq("id", lockRow.id);
     }
   } catch (err) {
     console.error("classify-response background error:", err);
