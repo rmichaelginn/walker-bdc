@@ -39,7 +39,7 @@ async function classify(message: string): Promise<string> {
       max_tokens: 10,
       messages: [{
         role: "user",
-        content: `Classify this text message response as exactly one word: positive, negative, or gray.\npositive = interested, curious, maybe, any engagement\nnegative = not interested, happy with car, stop, no thanks\ngray = vague, ambiguous\n\nMessage: "${message}"\n\nRespond with one word only.`
+        content: `Classify this text message response as exactly one word: positive, negative, gray, or unclear.\npositive = interested, curious, maybe, any engagement\nnegative = not interested, happy with car, stop, no thanks\ngray = vague, ambiguous\nunclear = gibberish, emojis only, or a single character; appears to be a wrong number or accidental text; in a foreign language we can't interpret; rude, hostile, aggressive, or uses profanity\n\nMessage: "${message}"\n\nRespond with one word only.`
       }]
     }),
   });
@@ -47,6 +47,7 @@ async function classify(message: string): Promise<string> {
   const text = data.content?.[0]?.text?.toLowerCase().trim() || "gray";
   if (text.includes("positive")) return "positive";
   if (text.includes("negative")) return "negative";
+  if (text.includes("unclear")) return "unclear";
   return "gray";
 }
 
@@ -86,15 +87,40 @@ Reply only with the text message response. Nothing else.`;
 async function processMessage(phone: string, message: string) {
   try {
     const digits = phone.replace(/\D/g, "").slice(-10);
+    const matchesPhone = (p: string | null) =>
+      (p || "").replace(/\D/g, "").slice(-10) === digits;
+
+    // Bug fix 1: don't auto-reply more than once per conversation. If we already
+    // logged a response for this phone in the last 24h, we've already replied — skip.
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data: recentResponses } = await supabase
+      .from("responses")
+      .select("phone")
+      .gte("created_at", cutoff);
+
+    if ((recentResponses || []).some((r: any) => matchesPhone(r.phone))) {
+      console.log("classify-response: already replied to this number in last 24h, skipping");
+      return;
+    }
+
+    // Bug fix 2: only respond to people we texted first. If there's no outbound
+    // message to this phone in our system, skip.
+    const { data: outbound } = await supabase
+      .from("messages")
+      .select("phone")
+      .eq("direction", "outbound");
+
+    if (!(outbound || []).some((m: any) => matchesPhone(m.phone))) {
+      console.log("classify-response: no prior outbound message to this number, skipping");
+      return;
+    }
+
     const { data: appointments } = await supabase
       .from("appointments")
       .select("id, first_name, phone")
       .eq("approved", true);
 
-    const appointment = (appointments || []).find((a: any) => {
-      const aDigits = (a.phone || "").replace(/\D/g, "").slice(-10);
-      return aDigits === digits;
-    });
+    const appointment = (appointments || []).find((a: any) => matchesPhone(a.phone));
 
     const classification = await classify(message);
 
@@ -106,12 +132,17 @@ async function processMessage(phone: string, message: string) {
       alert_sent: false,
     });
 
-    // Wait before replying so the response feels human.
-    await delay(45000);
-
-    if (classification === "negative") {
+    if (classification === "unclear") {
+      // Don't reply to unusual messages — alert the team to handle it manually, immediately (no delay).
+      await sendText(ALERT_PHONE, `WALKER BDC: ${appointment?.first_name || "Customer"} sent an unusual message: '${message}'. Review and respond manually.`);
+      await supabase.from("responses").update({ alert_sent: true }).eq("phone", phone).eq("classification", classification);
+    } else if (classification === "negative") {
+      // Wait before replying to the customer so the response feels human.
+      await delay(45000);
       await sendText(phone, NEGATIVE_REPLY);
     } else {
+      // Wait before replying to the customer so the response feels human.
+      await delay(45000);
       const reply = await generateReply(message);
       await sendText(phone, reply);
       await sendText(ALERT_PHONE, `WALKER BDC: ${appointment?.first_name || "Customer"} responded ${classification}. Their message: '${message}'. Take over now.`);
