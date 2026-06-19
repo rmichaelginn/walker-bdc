@@ -138,10 +138,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   const found = (appointments ?? []) as Appointment[];
 
+  // Any outbound message newer than this cutoff counts as a recent contact.
+  const ninetyDaysAgo = new Date(
+    Date.now() - 90 * 24 * 60 * 60 * 1000,
+  ).toISOString();
+
   let sent = 0;
+  let skippedRecent = 0;
   const results: Array<{
     appointment_id: Appointment["id"];
-    status: "sent" | "failed" | "skipped";
+    status: "sent" | "failed" | "skipped" | "skipped_recent_contact";
     error?: string;
   }> = [];
 
@@ -153,6 +159,33 @@ Deno.serve(async (req: Request): Promise<Response> => {
         status: "skipped",
         error: "No phone number on appointment.",
       });
+      continue;
+    }
+
+    // Skip anyone we've already messaged in the last 90 days.
+    const { data: recent, error: recentError } = await supabase
+      .from("messages")
+      .select("id")
+      .eq("phone", appt.phone)
+      .eq("direction", "outbound")
+      .gte("created_at", ninetyDaysAgo)
+      .limit(1);
+
+    if (recentError) {
+      results.push({
+        appointment_id: appt.id,
+        status: "failed",
+        error: `Failed to check recent contact: ${recentError.message}`,
+      });
+      continue;
+    }
+
+    if (recent && recent.length > 0) {
+      results.push({
+        appointment_id: appt.id,
+        status: "skipped_recent_contact",
+      });
+      skippedRecent++;
       continue;
     }
 
@@ -210,6 +243,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   return jsonResponse({
     requested: ids.length,
     sent,
+    skipped_recent_contact: skippedRecent,
     results,
   });
 });
