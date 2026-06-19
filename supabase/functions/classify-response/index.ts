@@ -1,3 +1,5 @@
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
 // supabase/functions/classify-response/index.ts
 //
 // Called by an OpenPhone webhook whenever a customer replies to an outreach text.
@@ -17,7 +19,6 @@
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const OPENPHONE_API_URL = "https://api.openphone.com/v1/messages";
 const MODEL = "claude-sonnet-4-6";
 
@@ -34,30 +35,6 @@ const corsHeaders = {
 };
 
 type Classification = "positive" | "negative" | "gray";
-
-// Tool Claude is forced to call so we always get back exactly one of the three
-// labels instead of free-form prose.
-const classifyTool = {
-  name: "record_classification",
-  description:
-    "Record the classification of a customer's text-message reply to a " +
-    "vehicle-upgrade outreach. Call this exactly once.",
-  input_schema: {
-    type: "object",
-    properties: {
-      classification: {
-        type: "string",
-        enum: ["positive", "negative", "gray"],
-        description:
-          "positive = interested, curious, maybe, or any engagement that is not a " +
-          "clear no. negative = not interested, happy with their current car, asks " +
-          "to stop, or says no thanks. gray = vague, ambiguous, or unclear intent.",
-      },
-    },
-    required: ["classification"],
-    additionalProperties: false,
-  },
-};
 
 interface Appointment {
   id: number | string;
@@ -107,7 +84,19 @@ async function classifyMessage(
   message: string,
   apiKey: string,
 ): Promise<Classification> {
-  const res = await fetch(ANTHROPIC_API_URL, {
+  const classificationPrompt =
+    "A customer at a car dealership received a text asking if they were " +
+    "interested in upgrading their vehicle. Classify their reply below as " +
+    "exactly one of these three labels:\n\n" +
+    "positive = interested, curious, maybe, or any engagement that is not a " +
+    "clear no.\n" +
+    "negative = not interested, happy with their current car, asks to stop, " +
+    "or says no thanks.\n" +
+    "gray = vague, ambiguous, or unclear intent.\n\n" +
+    `Customer reply: "${message}"\n\n` +
+    'Respond with only one word: "positive", "negative", or "gray".';
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "x-api-key": apiKey,
@@ -116,40 +105,34 @@ async function classifyMessage(
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 1024,
-      tools: [classifyTool],
-      tool_choice: { type: "tool", name: "record_classification" },
-      messages: [
-        {
-          role: "user",
-          content:
-            "A customer at a car dealership received a text asking if they were " +
-            "interested in upgrading their vehicle. Classify their reply below using " +
-            "the record_classification tool.\n\n" +
-            `Customer reply: "${message}"`,
-        },
-      ],
+      max_tokens: 100,
+      messages: [{ role: "user", content: classificationPrompt }],
     }),
   });
 
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${detail}`);
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Anthropic API error ${response.status}: ${detail}`);
   }
 
-  const data = await res.json();
+  const data = await response.json();
 
-  const toolUse = (data.content ?? []).find(
-    (block: { type: string; name?: string }) =>
-      block.type === "tool_use" && block.name === "record_classification",
-  );
+  // The model returns its label as plain text; normalize and validate it.
+  const text = (data.content ?? [])
+    .filter((block: { type: string }) => block.type === "text")
+    .map((block: { text?: string }) => block.text ?? "")
+    .join(" ")
+    .toLowerCase();
 
-  const classification = toolUse?.input?.classification;
-  if (
-    classification !== "positive" &&
-    classification !== "negative" &&
-    classification !== "gray"
-  ) {
+  const classification: Classification | null = text.includes("positive")
+    ? "positive"
+    : text.includes("negative")
+    ? "negative"
+    : text.includes("gray")
+    ? "gray"
+    : null;
+
+  if (classification === null) {
     throw new Error("Claude did not return a valid classification.");
   }
 

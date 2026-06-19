@@ -168,7 +168,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       .select("id")
       .eq("phone", appt.phone)
       .eq("direction", "outbound")
-      .gte("created_at", ninetyDaysAgo)
+      .gte("sent_at", ninetyDaysAgo)
       .limit(1);
 
     if (recentError) {
