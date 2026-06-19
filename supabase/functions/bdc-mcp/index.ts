@@ -403,6 +403,21 @@ function createServer(): McpServer {
     },
   );
 
+  // 8. send_weekly_brief — trigger the weekly summary text.
+  server.tool(
+    "send_weekly_brief",
+    "Trigger the weekly brief, which texts the weekly summary to ALERT_PHONE.",
+    {},
+    async () => {
+      try {
+        const result = await callFunction("weekly-brief", {});
+        return textResult(result);
+      } catch (err) {
+        return errorResult((err as Error).message);
+      }
+    },
+  );
+
   return server;
 }
 
