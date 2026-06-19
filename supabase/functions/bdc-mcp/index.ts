@@ -1,45 +1,42 @@
-// supabase/functions/walker-bdc-mcp/index.ts
+// supabase/functions/bdc-mcp/index.ts
 //
 // MCP (Model Context Protocol) server for the Walker BDC texting program. It
 // exposes the BDC workflow — parse an appointment report, review/approve the
 // pending appointments, fire the outreach campaign, read the day's replies, and
 // send the EOD brief — as MCP tools an assistant can call.
 //
-// Built with the two-Hono-apps pattern (as in Cipher's cipher-mcp function): an
-// outer Hono app owns the function path prefix and the ?key= auth gate, and an
-// inner Hono app serves the MCP StreamableHTTP transport. The outer app routes
-// the inner one under the function name so the request path lines up with how
-// Supabase mounts the function.
-//
-// Auth: every request must carry ?key=<WALKER_BDC_MCP_KEY>.
+// Auth: every request to /mcp must carry the WALKER_BDC_MCP_KEY, supplied either
+// in the x-bdc-key header or the ?key= query param.
 //
 // Environment:
-//   WALKER_BDC_MCP_KEY          - shared secret required on the ?key= query param
+//   WALKER_BDC_MCP_KEY          - shared secret required on x-bdc-key / ?key=
 //   SUPABASE_URL                - injected by the Supabase runtime
 //   SUPABASE_SERVICE_ROLE_KEY   - service role key (bypasses RLS, calls functions)
 
-import { Hono } from "jsr:@hono/hono";
-import { StreamableHTTPTransport } from "jsr:@hono/mcp";
+export const config = {
+  verify_jwt: false,
+};
+
+import { Hono } from "npm:hono";
+import { StreamableHTTPTransport } from "npm:@hono/mcp";
 import { McpServer } from "npm:@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "npm:zod";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // Dealership-local timezone used to bound the "today" windows, matching the
 // eod-brief function so every part of the program agrees on the business day.
 const TIMEZONE = "America/Chicago";
 
-const FUNCTION_NAME = "walker-bdc-mcp";
-
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
-const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const MCP_KEY = Deno.env.get("WALKER_BDC_MCP_KEY") ?? "";
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const WALKER_BDC_MCP_KEY = Deno.env.get("WALKER_BDC_MCP_KEY") ?? "";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 function supabaseClient() {
-  return createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+  return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
 }
@@ -69,7 +66,7 @@ async function callFunction(
   const res = await fetch(`${SUPABASE_URL}/functions/v1/${name}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${SERVICE_ROLE_KEY}`,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body ?? {}),
@@ -162,9 +159,9 @@ function todayRange(timeZone: string): { start: string; end: string } {
 // MCP server + tools
 // ---------------------------------------------------------------------------
 
-function buildServer(): McpServer {
+function createServer(): McpServer {
   const server = new McpServer({
-    name: "walker-bdc-mcp",
+    name: "bdc-mcp",
     version: "1.0.0",
   });
 
@@ -402,33 +399,27 @@ function buildServer(): McpServer {
   return server;
 }
 
-// ---------------------------------------------------------------------------
-// Two Hono apps: inner serves the MCP transport, outer gates auth + path.
-// ---------------------------------------------------------------------------
-
 const mcpApp = new Hono();
-
-mcpApp.all("/", async (c) => {
+mcpApp.get("/", (c) => c.json({ status: "Walker BDC MCP server running", version: "1.0.0" }));
+mcpApp.get("/.well-known/oauth-authorization-server", (c) => {
+  const base = "https://czqmtligstabldvwaifu.supabase.co/functions/v1/bdc-mcp";
+  return c.json({
+    issuer: base,
+    authorization_endpoint: `${base}/auth`,
+    token_endpoint: `${base}/token`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+  });
+});
+mcpApp.all("/mcp", async (c) => {
+  if (c.req.method !== "POST") return c.json({ error: "Method not allowed" }, 405);
+  const provided = c.req.header("x-bdc-key") || c.req.query("key");
+  if (!provided || provided !== WALKER_BDC_MCP_KEY) return c.json({ error: "Unauthorized" }, 401);
+  const server = createServer();
   const transport = new StreamableHTTPTransport();
-  const server = buildServer();
   await server.connect(transport);
   return transport.handleRequest(c);
 });
-
 const app = new Hono();
-
-// ?key= auth gate on every request to this function.
-app.use("*", async (c, next) => {
-  if (!MCP_KEY) {
-    return c.json({ error: "WALKER_BDC_MCP_KEY is not configured." }, 500);
-  }
-  if (c.req.query("key") !== MCP_KEY) {
-    return c.json({ error: "Unauthorized." }, 401);
-  }
-  await next();
-});
-
-// Supabase mounts the function under its name; route the MCP app there.
-app.route(`/${FUNCTION_NAME}`, mcpApp);
-
+app.route("/bdc-mcp", mcpApp);
 Deno.serve(app.fetch);
